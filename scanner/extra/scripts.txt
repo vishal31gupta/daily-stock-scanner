@@ -1,0 +1,18 @@
+python .\03_eod_downloader.py --fresh --date 2026-10-09
+
+python .\04_export_market_data_to_excel.py --data-root data\market_data_clean --date 2026-10-06
+
+python .\05_validate_market_data.py --data-root data\market_data_clean --date 2026-10-07
+
+python 06_import_parquet_to_duckdb.py --date 2026-10-08
+
+python 07_import_historical_nifty_options.py --file "C:\path\to\OCT_2021.zip"
+
+python 07_import_historical_nifty_options.py --file "D:\HistoricalData\NIFTY_OPTIONS.xlsx"
+
+To get data for Particular Date :
+
+SELECT *
+FROM NIFTY_OPTIONS
+WHERE CAST(date AS DATE) = DATE '2026-10-07'
+ORDER BY date, tradingsymbol;
