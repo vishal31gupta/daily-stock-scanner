@@ -1,0 +1,11 @@
+# Direct runtime dependencies for the scanner scripts.
+# Proposed pins for CPython 3.13; not runtime-tested in this repository.
+# See scanner/docs/PYTHON_ENVIRONMENT.md for rationale and limitations.
+numpy==2.5.4
+pandas==3.0.6
+kiteconnect==5.2.2
+duckdb==1.5.6
+pyarrow==26.0.0
+openpyxl==3.1.5
+xlrd==2.0.2
+tzdata==2026.5

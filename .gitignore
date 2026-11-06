@@ -218,3 +218,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local credentials and session state
+scanner/config.json
+scanner/session.json
+scanner/**/config.json
+scanner/**/session.json
+scanner/.env
+scanner/.env.*
+!scanner/.env.example
+
+# Generated local research data and exports
+scanner/data/
+scanner/**/*.duckdb
+scanner/**/*.duckdb.wal
+scanner/**/checkpoint.json
+scanner/**/*.parquet
+scanner/**/*.xlsx
+scanner/**/*.xls

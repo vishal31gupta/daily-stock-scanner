@@ -1,4 +1,4 @@
-python .\03_eod_downloader.py --fresh --date 2026-11-02
+python .\03_eod_downloader.py --fresh --date 2026-11-06
 
 python .\04_export_market_data_to_excel.py --data-root data\market_data_clean --date 2026-10-06
 
@@ -16,3 +16,11 @@ SELECT *
 FROM NIFTY_OPTIONS
 WHERE CAST(date AS DATE) = DATE '2026-10-07'
 ORDER BY date, tradingsymbol;
+
+python 08_enrich_nifty_options.py --date 2026-11-04
+
+python 08_enrich_nifty_options.py --date 2026-11-03 --dry-run
+
+python 08_enrich_nifty_options.py --start-date 2026-10-01 --end-date 2026-11-04
+
+python 08_enrich_nifty_options.py --date 2026-11-04 --risk-free-rate 0.06 --dividend-yield 0.01 --expiry-time 15:40 --year-fraction-basis ACT/365 --assumptions-as-of-date 2026-11-02
