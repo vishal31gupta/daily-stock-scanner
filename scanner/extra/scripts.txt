@@ -24,3 +24,12 @@ python 08_enrich_nifty_options.py --date 2026-11-03 --dry-run
 python 08_enrich_nifty_options.py --start-date 2026-10-01 --end-date 2026-11-04
 
 python 08_enrich_nifty_options.py --date 2026-11-04 --risk-free-rate 0.06 --dividend-yield 0.01 --expiry-time 15:40 --year-fraction-basis ACT/365 --assumptions-as-of-date 2026-11-02
+
+https://data.rbi.org.in/DBIE/#/dbie/reports/Statistics/Financial%20Market/Government%20Securities%20Market
+
+https://www.niftyindices.com/reports/historical-data
+
+python 08_enrich_nifty_options.py --start-date 2026-11-06 --end-date 2026-11-06 --expiry-time 15:40 --year-fraction-basis ACT/365
+
+
+python 09_download_historical_nifty_50.py --start-date 2026-10-01 --end-date 2026-10-01

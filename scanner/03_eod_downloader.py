@@ -20,6 +20,7 @@ SESSION_FILE = Path("session.json")
 INSTRUMENT_FILE = Path("data/instruments/research/research_instruments.csv")
 DEFAULT_OUTPUT_ROOT = Path("data/market_data")
 OUTPUT_ROOT = DEFAULT_OUTPUT_ROOT
+RUN_SUMMARY_FILE = Path(__file__).resolve().parent / "data" / "run_summaries" / "03_eod_downloader_runs.jsonl"
 TARGET_DATE = "2026-10-08"  # Keep unchanged while resuming this date; None = today
 REQUEST_DELAY_SECONDS = 1.0
 MAX_RETRIES = 6
@@ -261,6 +262,19 @@ def scan_persisted_tokens(target_output, token_to_dataset):
 # ============================ API ERROR CLASSIFICATION ============================
 def error_text(exc):
     return f"{type(exc).__name__}: {exc}"
+
+
+def append_run_summary(summary):
+    """Append one durable JSON record without affecting the downloader flow."""
+    try:
+        RUN_SUMMARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with RUN_SUMMARY_FILE.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(summary, sort_keys=True, allow_nan=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        print(f"Persistent run summary appended to: {RUN_SUMMARY_FILE}")
+    except Exception as exc:
+        print(f"WARNING: Could not append persistent run summary: {error_text(exc)}")
 
 
 def is_auth_error(exc):
@@ -507,6 +521,7 @@ def main():
     buffer_tokens = {name: [] for name in datasets}
     part_numbers = {name: get_existing_part_number(target_output / name) for name in datasets}
     counts = {"data": 0, "no_data": 0, "failed": 0, "invalid": 0}
+    data_tokens_this_run = set()
     processed = 0
     interrupted = False
 
@@ -556,6 +571,7 @@ def main():
                     else:
                         buffers[dataset].append(normalized)
                         buffer_tokens[dataset].append(token)
+                        data_tokens_this_run.add(token)
                         counts["data"] += 1
                         print(f"    Candles received and validated: {len(normalized):,}")
                         if len(buffers[dataset]) >= BATCH_INSTRUMENT_LIMIT:
@@ -658,6 +674,58 @@ def main():
         print("No pending instruments were found.")
     else:
         print("Run finished. No retryable failures remain; review no-data counts before treating collection as complete.")
+
+    instrument_status = []
+    for _, instrument in df.iterrows():
+        token = int(instrument["instrument_token"])
+        if token in persisted:
+            status = "saved"
+        elif token in no_data:
+            status = "no_data"
+        elif token in invalid_tokens:
+            status = "invalid_token"
+        elif token in failed_tokens:
+            status = "failed_retryable"
+        else:
+            status = "not_processed"
+        instrument_status.append({
+            "research_dataset": str(instrument["research_dataset"]),
+            "tradingsymbol": str(instrument["tradingsymbol"]),
+            "instrument_token": token,
+            "status": status,
+            "received_data_this_run": token in data_tokens_this_run,
+        })
+
+    run_status = (
+        "INTERRUPTED" if interrupted else
+        "INCOMPLETE" if finalization_error is not None or fatal_error is not None
+        or failed_tokens or invalid_tokens else "COMPLETED"
+    )
+    append_run_summary({
+        "record_type": "eod_download_run",
+        "run_started_at": run_start_datetime.astimezone().isoformat(),
+        "run_finished_at": run_end_datetime.astimezone().isoformat(),
+        "target_date": target_date.isoformat(),
+        "status": run_status,
+        "output_root": str(OUTPUT_ROOT.resolve()),
+        "output_folder": str(target_output.resolve()),
+        "duration_seconds": run_elapsed_seconds,
+        "counts": {
+            "universe_instruments": int(len(df)),
+            "verified_saved_instruments": len(persisted),
+            "explicit_no_data_instruments": len(no_data),
+            "invalid_token_instruments": len(invalid_tokens),
+            "failed_retryable_instruments": len(failed_tokens),
+            "data_responses_this_run": counts["data"],
+            "no_data_responses_this_run": counts["no_data"],
+            "invalid_token_responses_this_run": counts["invalid"],
+            "failed_requests_this_run": counts["failed"],
+        },
+        "instruments": instrument_status,
+        "warnings": warnings,
+        "fatal_error": error_text(fatal_error) if fatal_error else None,
+        "finalization_error": error_text(finalization_error) if finalization_error else None,
+    })
 
     # Nonzero status is important for scheduled runs: a partial run must not look successful.
     if interrupted or fatal_error is not None or finalization_error is not None or failed_tokens or invalid_tokens:

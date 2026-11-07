@@ -15,18 +15,24 @@ from __future__ import annotations
 
 import argparse
 import collections
+import csv
 import datetime as dt
 import json
 import math
 import os
 import re
+import sys
 import tempfile
+import time
 import uuid
+from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import duckdb
 import pandas as pd
+from openpyxl import load_workbook
 
 from nifty_options_enrichment import (
     CALCULATION_VERSION,
@@ -44,6 +50,9 @@ DEFAULT_OUTPUT_ROOT = Path("data/market_data_enriched/v1/NIFTY_OPTIONS")
 OPTION_DATASET = "NIFTY_OPTIONS"
 SPOT_DATASET = "NIFTY_50"
 VIX_DATASET = "INDIA_VIX"
+DEFAULT_RATE_SOURCE = Path("extra/Auctions of 91-Day Government of India Treasury Bills.xlsx")
+DEFAULT_DIVIDEND_SOURCE = Path("extra/NIFTY 50_Historical_PE_PB_DIV_Data_01042026to07112026.csv")
+RUN_SUMMARY_FILE = Path(__file__).resolve().parent / "data" / "run_summaries" / "08_nifty_options_enrichment_runs.jsonl"
 REQUIRED_OPTION_COLUMNS = {
     "date", "open", "high", "low", "close", "volume", "oi",
     "instrument_token", "tradingsymbol", "expiry", "strike", "option_type",
@@ -83,6 +92,40 @@ class EnrichmentError(RuntimeError):
     """Raised when input validation or output safety checks fail."""
 
 
+def _log_progress(message: str) -> None:
+    timestamp = dt.datetime.now().astimezone().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
+
+
+def _append_run_summary(
+    report: Mapping[str, Any], mode: str, started_at: dt.datetime,
+    status: str = "COMPLETED",
+) -> None:
+    """Persist one complete run summary as an append-only JSONL record."""
+    record = {
+        "record_type": "nifty_options_enrichment_run",
+        "run_started_at": started_at.isoformat(),
+        "run_finished_at": dt.datetime.now().astimezone().isoformat(),
+        "mode": mode,
+        "status": status,
+        "summary": report,
+    }
+    try:
+        RUN_SUMMARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with RUN_SUMMARY_FILE.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        _log_progress(f"Persistent run summary appended to {RUN_SUMMARY_FILE}.")
+    except Exception as exc:
+        _log_progress(f"WARNING: Could not append persistent run summary: {type(exc).__name__}: {exc}")
+
+
+def _elapsed_label(seconds: float) -> str:
+    minutes, remainder = divmod(max(0, int(seconds)), 60)
+    return f"{minutes}m {remainder:02d}s"
+
+
 def quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
@@ -101,6 +144,211 @@ def parquet_relation(files: Sequence[Path]) -> str:
 def parquet_files(root: Path, date_text: str, dataset: str) -> List[Path]:
     folder = root / date_text / dataset
     return sorted(path for path in folder.glob("*.parquet") if path.is_file())
+
+
+def _source_date(value: Any, source_name: str) -> Optional[dt.date]:
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        for date_format in ("%Y-%m-%d", "%d %b %Y", "%d-%b-%Y"):
+            try:
+                return dt.datetime.strptime(value, date_format).date()
+            except ValueError:
+                pass
+    return None
+
+
+def _source_percent(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip().replace(",", "").removesuffix("%")
+        if value in ("", "-", "–", "—"):
+            return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+@lru_cache(maxsize=8)
+def _read_91_day_yields(
+    source_name: str,
+) -> Tuple[Tuple[Tuple[dt.date, float], ...], Tuple[dt.date, ...]]:
+    source_path = Path(source_name)
+    if not source_path.is_file():
+        raise EnrichmentError(f"Risk-free-rate source file not found: {source_path}")
+    workbook = load_workbook(source_path, read_only=True, data_only=True)
+    try:
+        sheet = workbook[workbook.sheetnames[0]]
+        header_row = None
+        auction_column = yield_column = None
+        for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+            normalized = [str(value).strip().casefold() if value is not None else "" for value in row]
+            if "date of auction" in normalized:
+                header_row = row_number
+                auction_column = normalized.index("date of auction")
+                yield_column = next((
+                    index for index, label in enumerate(normalized)
+                    if label.startswith("implicit yield at cut-off price")
+                ), None)
+                break
+        if header_row is None or auction_column is None or yield_column is None:
+            raise EnrichmentError(
+                "Could not find Date of Auction and Implicit Yield at Cut-off Price columns "
+                f"in {source_path}"
+            )
+        observations = []
+        missing_yield_dates = []
+        seen_dates = set()
+        for row in sheet.iter_rows(min_row=header_row + 1, values_only=True):
+            if max(auction_column, yield_column) >= len(row):
+                continue
+            auction_date = _source_date(row[auction_column], str(source_path))
+            if auction_date is None:
+                continue
+            if auction_date in seen_dates:
+                raise EnrichmentError(
+                    f"Duplicate 91-day T-bill auction date {auction_date} in {source_path}"
+                )
+            seen_dates.add(auction_date)
+            yield_percent = _source_percent(row[yield_column])
+            if auction_date is None or yield_percent is None:
+                missing_yield_dates.append(auction_date)
+                continue
+            if not 0 <= yield_percent < 100:
+                raise EnrichmentError(
+                    f"Invalid cut-off yield {yield_percent} in {source_path} on {auction_date}"
+                )
+            observations.append((auction_date, yield_percent))
+        return tuple(sorted(observations)), tuple(sorted(missing_yield_dates))
+    finally:
+        workbook.close()
+
+
+def _load_91_day_cutoff_yield(
+    source_path: Path, observation_date: dt.date,
+) -> Tuple[float, dt.date]:
+    observations = [
+        (source_date, value) for source_date, value
+        in _read_91_day_yields(str(source_path.resolve()))[0]
+        if source_date < observation_date
+    ]
+    if not observations:
+        raise EnrichmentError(
+            f"No valid 91-day T-bill cut-off yield is available before {observation_date}"
+        )
+    source_date, yield_percent = observations[-1]
+    return yield_percent / 100.0, source_date
+
+
+@lru_cache(maxsize=8)
+def _read_nifty_dividend_source(
+    source_name: str,
+) -> Tuple[Tuple[Tuple[dt.date, float], ...], Tuple[dt.date, ...]]:
+    source_path = Path(source_name)
+    if not source_path.is_file():
+        raise EnrichmentError(f"Dividend-yield source file not found: {source_path}")
+    observations = []
+    missing_value_dates = []
+    seen_dates = set()
+    try:
+        with source_path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            required = {"indexname", "date", "div yield %"}
+            columns = {name.strip().casefold(): name for name in (reader.fieldnames or [])}
+            if not required.issubset(columns):
+                raise EnrichmentError(
+                    "Dividend CSV must contain IndexName, Date, and Div Yield % columns"
+                )
+            for row in reader:
+                if str(row.get(columns["indexname"], "")).strip().casefold() != "nifty 50":
+                    continue
+                source_date = _source_date(row.get(columns["date"]), str(source_path))
+                if source_date is None:
+                    raise EnrichmentError(f"Invalid date in dividend source {source_path}")
+                if source_date in seen_dates:
+                    raise EnrichmentError(
+                        f"Duplicate NIFTY 50 dividend-yield date {source_date} in {source_path}"
+                    )
+                seen_dates.add(source_date)
+                yield_percent = _source_percent(row.get(columns["div yield %"]))
+                if yield_percent is None:
+                    missing_value_dates.append(source_date)
+                    continue
+                if not 0 <= yield_percent < 100:
+                    raise EnrichmentError(
+                        f"Invalid NIFTY 50 dividend yield in {source_path} on {source_date}"
+                    )
+                observations.append((source_date, yield_percent))
+    except UnicodeDecodeError as exc:
+        raise EnrichmentError(f"Dividend CSV is not UTF-8: {source_path}") from exc
+    return tuple(sorted(observations)), tuple(sorted(missing_value_dates))
+
+
+def _read_nifty_dividend_yields(source_name: str) -> Tuple[Tuple[dt.date, float], ...]:
+    return _read_nifty_dividend_source(source_name)[0]
+
+
+def _load_nifty_dividend_yield(
+    source_path: Path, observation_date: dt.date,
+) -> Tuple[Optional[float], Optional[dt.date], Optional[float]]:
+    observations = _read_nifty_dividend_yields(str(source_path.resolve()))
+    prior = [(source_date, value) for source_date, value in observations
+             if source_date < observation_date]
+    current = next((value for source_date, value in observations
+                    if source_date == observation_date), None)
+    if not prior:
+        return None, None, current
+    source_date, yield_percent = prior[-1]
+    return yield_percent / 100.0, source_date, current
+
+
+def assumptions_from_source_files(
+    date_text: str,
+    expiry_time: dt.time,
+    year_fraction_basis: str,
+    rate_source: Path = DEFAULT_RATE_SOURCE,
+    dividend_source: Path = DEFAULT_DIVIDEND_SOURCE,
+    assumption_mode: str = "historical",
+) -> ModelAssumptions:
+    """Load dated RFR/dividend proxies using only values available before the session."""
+    observation_date = dt.date.fromisoformat(date_text)
+    risk_free_rate, rate_date = _load_91_day_cutoff_yield(rate_source, observation_date)
+    dividend_yield, dividend_date, same_day_dividend_percent = _load_nifty_dividend_yield(
+        dividend_source, observation_date
+    )
+    if dividend_yield is None or dividend_date is None:
+        raise EnrichmentError(
+            f"No prior NIFTY 50 dividend yield is available before {observation_date}"
+        )
+    assumptions_as_of_date = max(rate_date, dividend_date)
+    return ModelAssumptions(
+        risk_free_rate=risk_free_rate,
+        dividend_yield=dividend_yield,
+        expiry_time=expiry_time,
+        year_fraction_basis=year_fraction_basis,
+        assumptions_as_of_date=assumptions_as_of_date,
+        assumption_mode=assumption_mode,
+        assumptions_provisional=True,
+        source_metadata={
+            "risk_free_source": str(rate_source.resolve()),
+            "risk_free_method": "latest 91-day T-bill auction cut-off yield before observation date",
+            "risk_free_source_date": rate_date.isoformat(),
+            "risk_free_source_percent": risk_free_rate * 100.0,
+            "dividend_source": str(dividend_source.resolve()),
+            "dividend_method": "latest NIFTY 50 dividend yield before observation date",
+            "dividend_source_date": dividend_date.isoformat(),
+            "dividend_source_percent": dividend_yield * 100.0,
+            "dividend_same_date_row_found": same_day_dividend_percent is not None,
+            "dividend_same_date_percent": same_day_dividend_percent,
+            "assumptions_as_of_date_method": "later of the two source dates",
+        },
+    )
 
 
 def describe_relation(connection: duckdb.DuckDBPyConnection, relation: str) -> List[Tuple[str, str]]:
@@ -236,7 +484,6 @@ def _date_plan(
     input_rows = connection.execute(
         f"SELECT count(*) FROM {parquet_relation(option_files)}"
     ).fetchone()[0]
-    output_dir = output_root / date_text
     return {
         "date": date_text,
         "option_files": option_files,
@@ -250,8 +497,8 @@ def _date_plan(
         "input_rows": input_rows,
         "spot_rows": spot_rows,
         "vix_rows": vix_rows,
-        "output_path": output_dir / "enriched.parquet",
-        "report_path": output_dir / "enrichment_report.json",
+        "output_path": output_root / f"{date_text}.parquet",
+        "report_path": output_root / f"{date_text}.enrichment_report.json",
     }
 
 
@@ -331,8 +578,10 @@ def preflight_output_paths(
 ) -> List[Path]:
     targets = []
     for day in dates:
-        date_dir = output_root / day
-        targets.extend((date_dir / "enriched.parquet", date_dir / "enrichment_report.json"))
+        targets.extend((
+            output_root / f"{day}.parquet",
+            output_root / f"{day}.enrichment_report.json",
+        ))
     collisions = [path for path in targets if path.exists()]
     non_files = [path for path in collisions if not path.is_file()]
     if non_files:
@@ -543,42 +792,128 @@ def _validate_common_schema(plans: Sequence[Dict[str, Any]]) -> List[Tuple[str, 
     return expected
 
 
+def _model_configuration(assumptions: ModelAssumptions) -> Dict[str, Any]:
+    return {
+        "pricing_model": PRICING_MODEL,
+        "option_reference_price": "close",
+        "underlying_dataset": SPOT_DATASET,
+        "india_vix_dataset": VIX_DATASET,
+        "timestamp_join": "exact equality only; no forward fill",
+        "timezone": "Asia/Kolkata (fixed UTC+05:30)",
+        "expiry_time": assumptions.expiry_time.isoformat(),
+        "year_fraction_basis": assumptions.year_fraction_basis,
+        "assumptions_as_of_date": assumptions.assumptions_as_of_date.isoformat(),
+        "assumption_mode": assumptions.assumption_mode,
+        "risk_free_rate": assumptions.risk_free_rate,
+        "dividend_yield": assumptions.dividend_yield,
+        "assumptions_provisional": assumptions.assumptions_provisional,
+        "rate_and_yield_note": (
+            "RBI 91-day T-bill auction yield and NSE NIFTY 50 dividend yield are "
+            "provisional proxies, not a term-matched risk-free curve or forecast "
+            "dividend yield."
+            if assumptions.source_metadata is not None
+            else "User-supplied per run; provisional because historical rate and dividend curves are not loaded."
+        ),
+        "source_metadata": assumptions.source_metadata,
+        "sigma_min": assumptions.sigma_min,
+        "sigma_max": assumptions.sigma_max,
+        "solver_price_tolerance": assumptions.solver_tolerance,
+        "solver_max_iterations": assumptions.solver_max_iterations,
+        "greek_lot_size": NIFTY_LOT_SIZE,
+        "greek_units": {
+            "implied_volatility": "annualized volatility percentage (decimal volatility multiplied by 100)",
+            "delta": "option price change per one spot point, rounded to 2 decimal places",
+            "gamma": "delta change per one spot point, rounded to 4 decimal places",
+            "vega": "option price change per one volatility percentage point for a 65-unit lot, rounded to a whole number",
+            "theta": "option price change per calendar day for a 65-unit lot (annual theta / 365), rounded to a whole number",
+        },
+        "greek_output_format": {
+            "implied_volatility": {"scale": 100, "decimal_places": 2},
+            "delta": {"scale": 1, "decimal_places": 2},
+            "gamma": {"scale": 1, "decimal_places": 4},
+            "theta": {"scale": 1, "decimal_places": 0},
+            "vega": {"scale": 1, "decimal_places": 0},
+            "note": "Formatting is applied after full-precision IV and Greek calculations; theta and vega already include the 65-unit lot multiplier.",
+        },
+    }
+
+
+def _format_greeks_for_output(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Scale and round calculated values to the display precision used in AlgoTest."""
+    formats = {
+        "implied_volatility": (100.0, 2),
+        "delta": (1.0, 2),
+        "gamma": (1.0, 4),
+        "theta": (1.0, 0),
+        "vega": (1.0, 0),
+    }
+    for field, (scale, decimal_places) in formats.items():
+        value = result.get(field)
+        if value is not None:
+            result[field] = round(float(value) * scale, decimal_places)
+    return result
+
+
 def run_enrichment(
     input_root: Path,
     output_root: Path,
     dates: Sequence[str],
-    assumptions: ModelAssumptions,
+    assumptions: Union[ModelAssumptions, Mapping[str, ModelAssumptions]],
     overwrite: bool = False,
     chunk_size: int = 50000,
+    coverage_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Read selected date partitions, write separate enriched Parquet, and audit."""
-    assumptions.validate()
+    if isinstance(assumptions, ModelAssumptions):
+        assumptions_by_date = {day: assumptions for day in dates}
+    elif isinstance(assumptions, Mapping):
+        assumptions_by_date = dict(assumptions)
+    else:
+        raise ValueError("assumptions must be one ModelAssumptions or a per-date mapping")
+    missing_assumption_dates = sorted(set(dates).difference(assumptions_by_date))
+    if missing_assumption_dates:
+        raise EnrichmentError(
+            "No assumptions supplied for dates: " + ", ".join(missing_assumption_dates)
+        )
+    for day in dates:
+        assumptions_by_date[day].validate()
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
     _check_roots(input_root, output_root)
     if not dates:
         raise EnrichmentError("Select at least one explicit trading date")
-    if (
-        assumptions.assumption_mode == "historical"
-        and assumptions.assumptions_as_of_date > min(
-            dt.date.fromisoformat(day) for day in dates
-        )
-    ):
-        raise EnrichmentError(
-            "historical mode requires assumptions_as_of_date on or before the "
-            "earliest selected date; scenario mode permits later-known inputs"
-        )
+    for day in dates:
+        day_assumptions = assumptions_by_date[day]
+        if (
+            day_assumptions.assumption_mode == "historical"
+            and day_assumptions.assumptions_as_of_date > dt.date.fromisoformat(day)
+        ):
+            raise EnrichmentError(
+                f"historical mode for {day} requires assumptions_as_of_date on or "
+                "before the selected date; scenario mode permits later-known inputs"
+            )
 
     connection = duckdb.connect(database=":memory:")
     connection.execute("SET TimeZone='Asia/Kolkata'")
+    _log_progress(
+        f"Starting enrichment for {len(dates)} date(s); chunk size={chunk_size:,}."
+    )
     staged_outputs: Dict[str, Path] = {}
     staged_reports: Dict[str, Path] = {}
     reserved_outputs: List[Path] = []
     try:
-        plans = [
-            _date_plan(connection, input_root, output_root, day) for day in dates
-        ]
+        plans = []
+        for day in dates:
+            _log_progress(f"{day}: inspecting Parquet schemas, counts, and planned paths.")
+            plan = _date_plan(connection, input_root, output_root, day)
+            plans.append(plan)
+            _log_progress(
+                f"{day}: found {plan['input_rows']:,} option rows in "
+                f"{len(plan['option_files'])} file(s), {plan['spot_rows']:,} spot rows, "
+                f"{plan['vix_rows']:,} VIX rows."
+            )
         output_schema = _validate_common_schema(plans)
+        _log_progress("Input schemas agree across selected dates; checking output collisions.")
         preflight_output_paths(output_root, dates, overwrite=overwrite)
         output_root.mkdir(parents=True, exist_ok=True)
 
@@ -586,6 +921,11 @@ def run_enrichment(
         source_schemas = {}
         output_schemas = {}
         for plan in plans:
+            day_assumptions = assumptions_by_date[plan["date"]]
+            date_started = time.perf_counter()
+            _log_progress(
+                f"{plan['date']}: starting enrichment of {plan['input_rows']:,} option rows."
+            )
             plan["output_path"].parent.mkdir(parents=True, exist_ok=True)
             stage_path = plan["output_path"].with_name(
                 ".enriched.parquet." + uuid.uuid4().hex + ".tmp"
@@ -600,7 +940,9 @@ def run_enrichment(
             ) as temporary_dir:
                 temp_dir = Path(temporary_dir)
                 query = _joined_query(plan)
+                _log_progress(f"{plan['date']}: joining options to exact-time spot/VIX rows.")
                 cursor = connection.execute(query)
+                _log_progress(f"{plan['date']}: join ready; starting row calculations.")
                 # Keep a separate DuckDB connection for batch serialization:
                 # executing COPY on the query connection would replace its
                 # active result cursor before all source rows were fetched.
@@ -618,7 +960,10 @@ def run_enrichment(
                         rows = cursor.fetchmany(chunk_size)
                         if not rows:
                             break
-                        for row in rows:
+                        chunk_started = time.perf_counter()
+                        chunk_base = day_counts["input_rows"]
+                        progress_interval = min(10000, len(rows))
+                        for row_index, row in enumerate(rows, start=1):
                             source_values = row[:len(source_names)]
                             helper = row[len(source_names):]
                             option = {
@@ -626,8 +971,9 @@ def run_enrichment(
                                 for name, value in zip(source_names, source_values)
                             }
                             result = enrich_option_row(
-                                option, helper[0], helper[1], helper[2], helper[3], assumptions
+                                option, helper[0], helper[1], helper[2], helper[3], day_assumptions
                             ).as_dict()
+                            _format_greeks_for_output(result)
                             output_record = dict(zip(source_names, source_values))
                             output_record.update(result)
                             records.append(output_record)
@@ -635,7 +981,24 @@ def run_enrichment(
                                 day_counts, result, option.get("option_type"),
                                 option.get("close"), helper[0], helper[2]
                             )
+                            if (
+                                row_index % progress_interval == 0
+                                or row_index == len(rows)
+                            ):
+                                elapsed = max(time.perf_counter() - date_started, 1e-9)
+                                processed = chunk_base + row_index
+                                rows_per_second = processed / elapsed
+                                _log_progress(
+                                    f"{plan['date']}: calculated "
+                                    f"{processed:,}/{plan['input_rows']:,} rows "
+                                    f"({rows_per_second:,.0f} rows/s; "
+                                    f"{_elapsed_label(elapsed)} elapsed)."
+                                )
                         chunk_path = temp_dir / f"chunk_{chunk_number:06d}.parquet"
+                        _log_progress(
+                            f"{plan['date']}: writing temporary batch "
+                            f"{chunk_number + 1} ({len(records):,} rows)."
+                        )
                         _write_chunk(
                             batch_connection, records, output_schema,
                             chunk_path, chunk_number
@@ -643,6 +1006,10 @@ def run_enrichment(
                         chunk_paths.append(chunk_path)
                         records = []
                         chunk_number += 1
+                        _log_progress(
+                            f"{plan['date']}: temporary batch saved; batch time "
+                            f"{_elapsed_label(time.perf_counter() - chunk_started)}."
+                        )
                 finally:
                     batch_connection.close()
 
@@ -653,12 +1020,18 @@ def run_enrichment(
                 chunks = ",".join(
                     sql_string(path.resolve().as_posix()) for path in chunk_paths
                 )
+                _log_progress(
+                    f"{plan['date']}: combining {len(chunk_paths)} temporary batch(es) "
+                    "into the staged Parquet file."
+                )
                 connection.execute(
                     f"COPY (SELECT * FROM read_parquet([{chunks}], union_by_name=true)) "
                     f"TO {sql_string(stage_path.resolve().as_posix())} "
                     "(FORMAT PARQUET, COMPRESSION ZSTD)"
                 )
+                _log_progress(f"{plan['date']}: staged Parquet file written.")
 
+            _log_progress(f"{plan['date']}: checking staged row count and original values.")
             output_rows = connection.execute(
                 f"SELECT count(*) FROM {parquet_relation((stage_path,))}"
             ).fetchone()[0]
@@ -669,6 +1042,10 @@ def run_enrichment(
                 )
             left_only, right_only = _count_original_differences(
                 connection, plan["option_files"], stage_path, plan["option_schema"]
+            )
+            _log_progress(
+                f"{plan['date']}: original-value comparison complete "
+                f"(input-only={left_only:,}, output-only={right_only:,})."
             )
             if left_only or right_only:
                 raise EnrichmentError(
@@ -699,6 +1076,10 @@ def run_enrichment(
                 "output_only_original_rows": right_only,
                 "counts": day_counts,
             }
+            _log_progress(
+                f"{plan['date']}: validation complete; {output_rows:,} rows staged "
+                f"({_elapsed_label(time.perf_counter() - date_started)} elapsed)."
+            )
 
         all_counts = _new_counts()
         for daily in date_reports.values():
@@ -726,6 +1107,38 @@ def run_enrichment(
                 })
                 for field in target:
                     target[field] += value[field]
+
+        model_configuration = _model_configuration(assumptions_by_date[dates[0]])
+        model_configuration["assumptions_by_date"] = {
+            day: _model_configuration(assumptions_by_date[day])
+            for day in dates
+        }
+        if len(dates) > 1:
+            model_configuration["scope_note"] = (
+                "Top-level scalar assumptions describe the first selected date; "
+                "assumptions_by_date contains the authoritative values for each date."
+            )
+        coverage_details = dict(coverage_summary or {})
+        row_level_gaps = {
+            day: {
+                "option_rows_without_exact_spot_match": item["counts"]["missing_spot_count"],
+                "option_rows_without_exact_vix_match": item["counts"]["missing_vix_count"],
+            }
+            for day, item in date_reports.items()
+        }
+        coverage_details["row_level_missing_reference_matches"] = row_level_gaps
+        coverage_details["total_option_rows_without_exact_spot_match"] = sum(
+            item["option_rows_without_exact_spot_match"] for item in row_level_gaps.values()
+        )
+        coverage_details["total_option_rows_without_exact_vix_match"] = sum(
+            item["option_rows_without_exact_vix_match"] for item in row_level_gaps.values()
+        )
+        if (
+            coverage_details["total_option_rows_without_exact_spot_match"]
+            or coverage_details["total_option_rows_without_exact_vix_match"]
+        ):
+            coverage_details["has_missing_data"] = True
+            coverage_details["status"] = "WARNINGS"
 
         report = {
             "report_version": 1,
@@ -759,38 +1172,9 @@ def run_enrichment(
             "calculation_status_counts": all_counts["calculation_status_counts"],
             "assumption_timing_status_counts": all_counts["assumption_timing_status_counts"],
             "option_type_breakdown": all_counts["option_type_breakdown"],
-            "model_configuration": {
-                "pricing_model": PRICING_MODEL,
-                "option_reference_price": "close",
-                "underlying_dataset": SPOT_DATASET,
-                "india_vix_dataset": VIX_DATASET,
-                "timestamp_join": "exact equality only; no forward fill",
-                "timezone": "Asia/Kolkata (fixed UTC+05:30)",
-                "expiry_time": assumptions.expiry_time.isoformat(),
-                "year_fraction_basis": assumptions.year_fraction_basis,
-                "assumptions_as_of_date": assumptions.assumptions_as_of_date.isoformat(),
-                "assumption_mode": assumptions.assumption_mode,
-                "risk_free_rate": assumptions.risk_free_rate,
-                "dividend_yield": assumptions.dividend_yield,
-                "assumptions_provisional": assumptions.assumptions_provisional,
-                "rate_and_yield_note": (
-                    "User-supplied per run; provisional because this pipeline "
-                    "does not load historical rate/dividend curves."
-                ),
-                "sigma_min": assumptions.sigma_min,
-                "sigma_max": assumptions.sigma_max,
-                "solver_price_tolerance": assumptions.solver_tolerance,
-                "solver_max_iterations": assumptions.solver_max_iterations,
-                "greek_lot_size": NIFTY_LOT_SIZE,
-                "greek_units": {
-                    "implied_volatility": "decimal annualized volatility",
-                    "delta": "option price change per one spot point",
-                    "gamma": "delta change per one spot point",
-                    "vega": "option price change per one volatility percentage point for a 65-unit lot",
-                    "theta": "option price change per calendar day for a 65-unit lot (annual theta / 365)",
-                },
-            },
+            "model_configuration": model_configuration,
             "date_breakdown": date_reports,
+            "coverage_summary": coverage_details,
             "output_schema": _schema_as_records(output_schema),
             "checks": {
                 "input_output_row_counts_match": all(
@@ -823,6 +1207,7 @@ def run_enrichment(
         )):
             raise EnrichmentError("One or more output audit checks failed")
 
+        _log_progress("Building summary reports and performing final output reservations.")
         for plan in plans:
             day = plan["date"]
             staged_report = plan["report_path"].with_name(
@@ -843,6 +1228,7 @@ def run_enrichment(
                 if key in date_report:
                     date_report[key] = value
             date_report["date_breakdown"] = {day: date_reports[day]}
+            date_report["model_configuration"] = _model_configuration(assumptions_by_date[day])
             date_report["checks"] = dict(report["checks"])
             date_report["checks"]["outputs_by_date"] = {day: str(plan["output_path"].resolve())}
             date_report["checks"]["report_path"] = str(plan["report_path"].resolve())
@@ -867,6 +1253,10 @@ def run_enrichment(
                     "another file may have appeared during the run"
                 ) from exc
         for plan in plans:
+            _log_progress(
+                f"{plan['date']}: publishing {plan['output_path'].name} and "
+                f"{plan['report_path'].name}."
+            )
             os.replace(staged_outputs[plan["date"]], plan["output_path"])
             if plan["output_path"] in reserved_outputs:
                 reserved_outputs.remove(plan["output_path"])
@@ -874,6 +1264,7 @@ def run_enrichment(
             if plan["report_path"] in reserved_outputs:
                 reserved_outputs.remove(plan["report_path"])
         staged_reports.clear()
+        _log_progress("All selected dates were published successfully.")
         return report
     finally:
         for path in staged_outputs.values():
@@ -917,11 +1308,7 @@ def _parse_expiry_time(value: str) -> dt.time:
 def _selected_dates(args: argparse.Namespace, input_root: Path) -> List[str]:
     if args.date:
         found = parquet_files(input_root, args.date, OPTION_DATASET)
-        if not found:
-            raise EnrichmentError(
-                f"No NIFTY_OPTIONS input exists for explicitly requested {args.date}"
-            )
-        return [args.date]
+        return [args.date] if found else []
     if not args.start_date or not args.end_date:
         raise EnrichmentError("Provide --date or both --start-date and --end-date")
     start = dt.date.fromisoformat(args.start_date)
@@ -936,11 +1323,153 @@ def _selected_dates(args: argparse.Namespace, input_root: Path) -> List[str]:
         if start <= candidate <= end and parquet_files(input_root, folder.name, OPTION_DATASET):
             selected.append(folder.name)
     selected.sort()
-    if not selected:
-        raise EnrichmentError(
-            f"No NIFTY_OPTIONS data found between {args.start_date} and {args.end_date}"
-        )
     return selected
+
+
+def build_coverage_summary(
+    input_root: Path,
+    start_date: dt.date,
+    end_date: dt.date,
+    option_dates: Sequence[str],
+    assumptions_by_date: Optional[Mapping[str, ModelAssumptions]] = None,
+    assumption_errors: Optional[Mapping[str, str]] = None,
+    rate_source: Path = DEFAULT_RATE_SOURCE,
+    dividend_source: Path = DEFAULT_DIVIDEND_SOURCE,
+) -> Dict[str, Any]:
+    """Summarize available partitions and dividend-source gaps in a date range."""
+    partition_dates: Dict[str, Dict[str, bool]] = {}
+    for folder in input_root.iterdir() if input_root.exists() else ():
+        if not folder.is_dir() or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", folder.name):
+            continue
+        try:
+            day = dt.date.fromisoformat(folder.name)
+        except ValueError:
+            continue
+        if not start_date <= day <= end_date:
+            continue
+        partition_dates[folder.name] = {
+            dataset: bool(parquet_files(input_root, folder.name, dataset))
+            for dataset in (OPTION_DATASET, SPOT_DATASET, VIX_DATASET)
+        }
+
+    dividend_dates = set()
+    dividend_row_dates = set()
+    dividend_error = None
+    dividend_missing_value_dates = []
+    try:
+        dividend_records, dividend_missing_value_dates = _read_nifty_dividend_source(
+            str(dividend_source.resolve())
+        )
+        dividend_dates = {
+            day.isoformat() for day, _ in dividend_records
+            if start_date <= day <= end_date
+        }
+        dividend_row_dates = dividend_dates.union(
+            day.isoformat() for day in dividend_missing_value_dates
+            if start_date <= day <= end_date
+        )
+    except EnrichmentError as exc:
+        dividend_error = str(exc)
+    rate_error = None
+    rate_missing_yield_dates = []
+    try:
+        _, rate_missing_yield_dates = _read_91_day_yields(str(rate_source.resolve()))
+    except EnrichmentError as exc:
+        rate_error = str(exc)
+
+    known_sessions = {
+        day for day, datasets in partition_dates.items() if any(datasets.values())
+    }.union(dividend_row_dates)
+    missing_option_dates = sorted(
+        day for day in known_sessions
+        if not partition_dates.get(day, {}).get(OPTION_DATASET, False)
+    )
+    option_partition_dates = sorted(
+        day for day, datasets in partition_dates.items()
+        if datasets.get(OPTION_DATASET, False)
+    )
+    missing_spot_dates = sorted(
+        day for day in option_partition_dates
+        if not partition_dates[day].get(SPOT_DATASET, False)
+    )
+    missing_vix_dates = sorted(
+        day for day in option_partition_dates
+        if not partition_dates[day].get(VIX_DATASET, False)
+    )
+    missing_dividend_dates = sorted(known_sessions.difference(dividend_dates))
+    unobserved_weekdays = []
+    cursor = start_date
+    while cursor <= end_date:
+        day_text = cursor.isoformat()
+        if cursor.weekday() < 5 and day_text not in known_sessions:
+            unobserved_weekdays.append(day_text)
+        cursor += dt.timedelta(days=1)
+
+    fallback_dates = []
+    source_values = {}
+    for day, assumptions in (assumptions_by_date or {}).items():
+        metadata = assumptions.source_metadata or {}
+        if metadata and not metadata.get("dividend_same_date_row_found", True):
+            fallback_dates.append(day)
+        source_values[day] = {
+            "risk_free_rate": assumptions.risk_free_rate,
+            "dividend_yield": assumptions.dividend_yield,
+            "assumptions_as_of_date": assumptions.assumptions_as_of_date.isoformat(),
+            "risk_free_source_date": metadata.get("risk_free_source_date"),
+            "dividend_source_date": metadata.get("dividend_source_date"),
+            "dividend_same_date_row_found": metadata.get("dividend_same_date_row_found"),
+        }
+
+    in_range_dividend_missing_values = [
+        day for day in dividend_missing_value_dates if start_date <= day <= end_date
+    ]
+    in_range_rate_missing_values = [
+        day for day in rate_missing_yield_dates if start_date <= day <= end_date
+    ]
+    missing_parquet = bool(missing_option_dates or missing_spot_dates or missing_vix_dates)
+    missing_source_data = bool(
+        missing_dividend_dates
+        or in_range_dividend_missing_values
+        or in_range_rate_missing_values
+        or dividend_error
+        or rate_error
+        or assumption_errors
+        or fallback_dates
+    )
+    return {
+        "status": "WARNINGS" if missing_parquet or missing_source_data else (
+            "REVIEW_UNCLASSIFIED_DATES" if unobserved_weekdays else "OK"
+        ),
+        "has_missing_data": missing_parquet or missing_source_data,
+        "requested_range": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
+        "known_session_dates": sorted(known_sessions),
+        "dates_with_option_data": option_partition_dates,
+        "missing_parquet_dates": {
+            OPTION_DATASET: missing_option_dates,
+            SPOT_DATASET: missing_spot_dates,
+            VIX_DATASET: missing_vix_dates,
+        },
+        "missing_dividend_csv_dates": missing_dividend_dates,
+        "dividend_csv_rows_with_missing_yield": [
+            day.isoformat() for day in in_range_dividend_missing_values
+        ],
+        "dividend_csv_path": str(dividend_source.resolve()),
+        "dividend_csv_error": dividend_error,
+        "risk_free_source_path": str(rate_source.resolve()),
+        "risk_free_source_error": rate_error,
+        "rbi_auction_rows_without_cutoff_yield": [
+            day.isoformat() for day in in_range_rate_missing_values
+        ],
+        "used_prior_dividend_value_when_same_date_row_missing": sorted(fallback_dates),
+        "automatic_assumptions_by_date": source_values,
+        "dates_skipped_for_assumption_errors": dict(assumption_errors or {}),
+        "unobserved_weekdays_not_classified": unobserved_weekdays,
+        "coverage_note": (
+            "Known sessions are the union of dates with any local Parquet partition "
+            "and dates in the dividend CSV. Weekdays without either are listed as "
+            "unclassified because they may be NSE holidays or missing all local data."
+        ),
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -950,30 +1479,38 @@ def build_parser() -> argparse.ArgumentParser:
             "Black-Scholes-Merton IV and Greeks."
         ),
         epilog=(
-            "Run from scanner. A real-data run requires explicit risk-free rate, "
-            "dividend yield, expiry time, year-fraction basis and assumptions "
-            "as-of date. Example: "
-            "python 08_enrich_nifty_options.py --date 2026-11-03 --dry-run"
+            "Run from scanner. Unless all three manual values are supplied, "
+            "risk-free rate, dividend yield, and assumptions as-of date are "
+            "loaded from the local RBI/NIFTY source files. Expiry time and "
+            "year-fraction basis remain explicit. Example: "
+            "python 08_enrich_nifty_options.py --start-date 2026-11-02 "
+            "--end-date 2026-11-06 --expiry-time 15:40 --year-fraction-basis ACT/365"
         ),
     )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--date", type=_parse_iso_date, help="one explicit trading date")
-    selection.add_argument("--start-date", type=_parse_iso_date, help="inclusive range start")
-    parser.add_argument("--end-date", type=_parse_iso_date, help="inclusive range end")
+    selection.add_argument("--start-date", type=_parse_iso_date,
+                           help="inclusive range start; processes available option partitions")
+    parser.add_argument("--end-date", type=_parse_iso_date,
+                        help="inclusive range end; coverage summary reports missing data")
     parser.add_argument("--input-root", type=Path, default=DEFAULT_INPUT_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--dry-run", action="store_true",
-                        help="inspect files, counts and paths without writing output")
+                        help="summarize range coverage, counts and paths without writing output")
     parser.add_argument("--overwrite", action="store_true",
                         help="explicitly allow replacement of existing enriched output")
     parser.add_argument("--risk-free-rate", type=float,
-                        help="annual continuously compounded rate as decimal; required for real runs")
+                        help="manual annual continuously compounded rate as decimal (supply with both other manual assumptions)")
     parser.add_argument("--dividend-yield", type=float,
-                        help="annual continuous yield as decimal; required for real runs")
+                        help="manual annual continuous yield as decimal (supply with the other two manual assumptions)")
     parser.add_argument("--expiry-time", type=_parse_expiry_time,
                         help="contract expiry wall time in Asia/Kolkata; required for real runs")
     parser.add_argument("--assumptions-as-of-date", type=_parse_iso_date,
-                        help="date rate/yield inputs were known; must be <= selected dates")
+                        help="manual date rate/yield inputs were known; supply with both manual rates")
+    parser.add_argument("--risk-free-source", type=Path, default=DEFAULT_RATE_SOURCE,
+                        help="RBI 91-day T-bill workbook (default: %(default)s)")
+    parser.add_argument("--dividend-source", type=Path, default=DEFAULT_DIVIDEND_SOURCE,
+                        help="NIFTY historical valuation CSV (default: %(default)s)")
     parser.add_argument(
         "--assumption-mode", choices=("historical", "scenario"), default="historical",
         help=(
@@ -997,6 +1534,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    run_started_at = dt.datetime.now().astimezone()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.date is None and args.start_date is None:
@@ -1007,8 +1545,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--end-date is only valid with --start-date")
     try:
         dates = _selected_dates(args, args.input_root)
+        start_date = dt.date.fromisoformat(args.date or args.start_date)
+        end_date = dt.date.fromisoformat(args.date or args.end_date)
+        _log_progress(
+            f"Selected {len(dates)} date(s) with NIFTY_OPTIONS partitions "
+            f"from {start_date} through {end_date}."
+        )
         if args.dry_run:
-            report = build_dry_run_report(args.input_root, args.output_root, dates)
+            _log_progress("Dry run: scanning date-range coverage and source files.")
+            coverage = build_coverage_summary(
+                args.input_root, start_date, end_date, dates,
+                rate_source=args.risk_free_source,
+                dividend_source=args.dividend_source,
+            )
+            if dates:
+                report = build_dry_run_report(args.input_root, args.output_root, dates)
+            else:
+                report = {
+                    "mode": "dry_run_no_writes",
+                    "selected_dates": [],
+                    "input_root": str(args.input_root.resolve()),
+                    "output_root": str(args.output_root.resolve()),
+                }
+            report["coverage_summary"] = coverage
             report["existing_output_targets"] = [
                 str(path.resolve())
                 for path in preflight_output_paths(
@@ -1016,38 +1575,137 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 if path.exists()
             ]
+            _log_progress(
+                f"Dry run complete: coverage status={coverage['status']}; "
+                "no enrichment outputs were written."
+            )
+            _append_run_summary(report, "dry_run", run_started_at)
             print(json.dumps(report, indent=2, sort_keys=True))
             return 0
+        if not dates:
+            coverage = build_coverage_summary(
+                args.input_root, start_date, end_date, dates,
+                rate_source=args.risk_free_source,
+                dividend_source=args.dividend_source,
+            )
+            report = {
+                "mode": "no_option_data_found",
+                "coverage_summary": coverage,
+            }
+            _append_run_summary(report, "no_option_data_found", run_started_at, "NO_OPTION_DATA")
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 2
         missing = [
-            name for name in (
-                "risk-free-rate", "dividend-yield", "expiry-time",
-                "year-fraction-basis", "assumptions-as-of-date"
-            ) if getattr(args, name.replace("-", "_")) is None
+            name for name in ("expiry-time", "year-fraction-basis")
+            if getattr(args, name.replace("-", "_")) is None
         ]
         if missing:
             parser.error(
                 "real-data runs require explicit --" + ", --".join(missing)
             )
-        assumptions = ModelAssumptions(
-            risk_free_rate=args.risk_free_rate,
-            dividend_yield=args.dividend_yield,
-            expiry_time=args.expiry_time,
-            year_fraction_basis=args.year_fraction_basis,
-            assumptions_as_of_date=dt.date.fromisoformat(args.assumptions_as_of_date),
-            assumption_mode=args.assumption_mode,
-            assumptions_provisional=True,
-            sigma_min=args.sigma_min,
-            sigma_max=args.sigma_max,
-            solver_tolerance=args.solver_tolerance,
-            solver_max_iterations=args.solver_max_iterations,
+        manual_values = (
+            args.risk_free_rate, args.dividend_yield, args.assumptions_as_of_date
+        )
+        if any(value is not None for value in manual_values) and not all(
+            value is not None for value in manual_values
+        ):
+            parser.error(
+                "manual assumptions require --risk-free-rate, --dividend-yield, "
+                "and --assumptions-as-of-date together; omit all three to load "
+                "the local source files"
+            )
+        assumption_errors = {}
+        if all(value is not None for value in manual_values):
+            _log_progress("Using the three manually supplied rate/yield assumptions.")
+            assumptions = ModelAssumptions(
+                risk_free_rate=args.risk_free_rate,
+                dividend_yield=args.dividend_yield,
+                expiry_time=args.expiry_time,
+                year_fraction_basis=args.year_fraction_basis,
+                assumptions_as_of_date=dt.date.fromisoformat(args.assumptions_as_of_date),
+                assumption_mode=args.assumption_mode,
+                assumptions_provisional=True,
+                sigma_min=args.sigma_min,
+                sigma_max=args.sigma_max,
+                solver_tolerance=args.solver_tolerance,
+                solver_max_iterations=args.solver_max_iterations,
+            )
+            assumptions_by_date = {day: assumptions for day in dates}
+        else:
+            _log_progress(
+                f"Loading automatic rate/yield assumptions for {len(dates)} date(s)."
+            )
+            assumptions_by_date = {}
+            for day in dates:
+                try:
+                    assumptions_by_date[day] = assumptions_from_source_files(
+                        day,
+                        args.expiry_time,
+                        args.year_fraction_basis,
+                        args.risk_free_source,
+                        args.dividend_source,
+                        args.assumption_mode,
+                    )
+                    _log_progress(
+                        f"{day}: assumptions loaded (rate source "
+                        f"{assumptions_by_date[day].source_metadata['risk_free_source_date']}, "
+                        f"dividend source "
+                        f"{assumptions_by_date[day].source_metadata['dividend_source_date']})."
+                    )
+                except EnrichmentError as exc:
+                    assumption_errors[day] = str(exc)
+                    _log_progress(f"{day}: skipped automatic assumptions: {exc}")
+            assumptions_by_date = {
+                day: replace(
+                    assumptions,
+                    sigma_min=args.sigma_min,
+                    sigma_max=args.sigma_max,
+                    solver_tolerance=args.solver_tolerance,
+                    solver_max_iterations=args.solver_max_iterations,
+                )
+                for day, assumptions in assumptions_by_date.items()
+            }
+        valid_dates = sorted(assumptions_by_date)
+        coverage = build_coverage_summary(
+            args.input_root, start_date, end_date, dates,
+            assumptions_by_date, assumption_errors,
+            args.risk_free_source, args.dividend_source,
+        )
+        _log_progress(
+            f"Coverage scan complete: status={coverage['status']}; "
+            f"{len(coverage['missing_parquet_dates'][OPTION_DATASET])} missing "
+            "NIFTY_OPTIONS partition(s), "
+            f"{len(coverage['missing_dividend_csv_dates'])} missing dividend CSV date(s)."
+        )
+        if not valid_dates:
+            report = {
+                "mode": "no_dates_with_complete_assumptions",
+                "coverage_summary": coverage,
+            }
+            _append_run_summary(
+                report, "no_dates_with_complete_assumptions", run_started_at,
+                "NO_COMPLETE_ASSUMPTIONS",
+            )
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 2
+        _log_progress(
+            f"Starting real-data enrichment for {len(valid_dates)} date(s); "
+            "the final JSON summary will print after validation and publication."
         )
         report = run_enrichment(
-            args.input_root, args.output_root, dates, assumptions,
-            overwrite=args.overwrite, chunk_size=args.chunk_size
+            args.input_root, args.output_root, valid_dates, assumptions_by_date,
+            overwrite=args.overwrite, chunk_size=args.chunk_size,
+            coverage_summary=coverage,
         )
+        _log_progress("Enrichment run finished successfully.")
+        _append_run_summary(report, "enrichment", run_started_at, str(report.get("status", "COMPLETED")))
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0
     except (EnrichmentError, FileExistsError, ValueError, OSError, duckdb.Error) as exc:
+        _append_run_summary(
+            {"error_type": type(exc).__name__, "error": str(exc)},
+            "failed", run_started_at, "FAILED",
+        )
         parser.exit(2, f"ERROR: {exc}\n")
     return 2
 

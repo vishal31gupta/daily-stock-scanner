@@ -12,7 +12,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 
-CALCULATION_VERSION = "nifty-options-enrichment-v1.1.0"
+CALCULATION_VERSION = "nifty-options-enrichment-v1.2.0"
 PRICING_MODEL = "BLACK_SCHOLES_MERTON_CONTINUOUS_YIELD"
 INDIA_TZ = timezone(timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 SUCCESS_STATUSES = frozenset(("OK", "MISSING_VIX"))
@@ -46,6 +46,7 @@ class ModelAssumptions:
     sigma_max: float = 5.0
     solver_tolerance: float = 1e-8
     solver_max_iterations: int = 100
+    source_metadata: Optional[Dict[str, Any]] = None
 
     def validate(self) -> None:
         values = (self.risk_free_rate, self.dividend_yield, self.sigma_min,
